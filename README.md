@@ -1,5 +1,7 @@
 # Nyuki-Tech
 
+NB - Utilities.h and The Ino file need to be in the same folder.
+
 ### DHT Sensor Pinout
 
 | DHT Pin | ESP32 Pin | Function |
