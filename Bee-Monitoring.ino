@@ -22,15 +22,42 @@
 
 #include "esp_sleep.h"
 
+// Battery monitoring configuration
+#define BATTERY_ADC_PIN 35
+
+// BCD DateTime Structure
+struct BCDDateTime {
+  uint8_t second;
+  uint8_t minute;
+  uint8_t hour;
+  uint8_t day;
+  uint8_t month;
+  uint8_t year;
+};
+
 // ✅ FORWARD DECLARATION - Declare struct before RTC variables
 struct SensorPayload {
   uint32_t timestamp;
+  uint32_t measured_time;     // NEW: When measurement was taken
+  uint32_t transmitted_time;  // NEW: When payload was transmitted
   uint16_t payload_id;
   float temperature;
   float humidity;
+  float battery_voltage;
+  int battery_percentage;
   bool valid;
   bool transmitted;  // ✅ NEW: Track transmission status to prevent duplicates
 };
+
+int getBatteryPercentage(float voltage) {
+  if (voltage >= 4.1) return 100;
+  if (voltage >= 3.9) return 80;
+  if (voltage >= 3.8) return 60;
+  if (voltage >= 3.7) return 40;
+  if (voltage >= 3.6) return 20;
+  if (voltage >= 3.4) return 10;
+  return 0;
+}
 
 // ✅ RTC MEMORY VARIABLES - These survive deep sleep
 RTC_DATA_ATTR int rtc_buffer_index = 0;
@@ -55,7 +82,7 @@ const char *bcd_topic_base = "beehive/frame";
 const char* deviceName = "Bee-01"; 
 
 // Timing Configuration
-//#define DEVELOPMENT_MODE true  
+// #define DEVELOPMENT_MODE true  
 
 #ifdef DEVELOPMENT_MODE
   const int MEASUREMENT_INTERVAL = 10;  // 10 seconds for development
@@ -95,16 +122,6 @@ DHT dht(DHTPIN, DHTTYPE);
 TinyGsm modem(SerialAT);
 TinyGsmClient client(modem);
 PubSubClient mqtt(client);
-
-// BCD DateTime Structure
-struct BCDDateTime {
-  uint8_t second;
-  uint8_t minute;
-  uint8_t hour;
-  uint8_t day;
-  uint8_t month;
-  uint8_t year;
-};
 
 // ✅ FIXED: Global variables now use RTC data directly
 int& bufferIndex = rtc_buffer_index;          // Reference to RTC memory
@@ -263,6 +280,14 @@ void createBCDProtocolFrame(SensorPayload& payload, uint8_t* frame, int& frameLe
   frame[frameLength++] = decimalToBCD(humidScaled % 100);
   frame[frameLength++] = decimalToBCD(humidScaled / 100);
   
+  // Battery voltage (scaled by 100)
+  uint16_t voltageScaled = (uint16_t)(payload.battery_voltage * 100);
+  frame[frameLength++] = decimalToBCD(voltageScaled % 100);
+  frame[frameLength++] = decimalToBCD(voltageScaled / 100);
+  
+  // Battery percentage
+  frame[frameLength++] = decimalToBCD(payload.battery_percentage);
+  
   BCDDateTime bcdTime = getCurrentBCDTime();
   frame[frameLength++] = bcdTime.second;
   frame[frameLength++] = bcdTime.minute;
@@ -286,7 +311,26 @@ void displayBCDData(SensorPayload& payload) {
   SerialMonitor.printf("Payload ID: %d\n", payload.payload_id);
   SerialMonitor.printf("Temperature: %.1f°C\n", payload.temperature);
   SerialMonitor.printf("Humidity: %.1f%%\n", payload.humidity);
-  SerialMonitor.printf("Timestamp: %lu\n", payload.timestamp);
+  SerialMonitor.printf("Battery Voltage: %.2fV\n", payload.battery_voltage);
+  SerialMonitor.printf("Battery Percentage: %d%%\n", payload.battery_percentage);
+  
+  // Show timing information
+  time_t measureTime = payload.measured_time;
+  struct tm* measureTm = localtime(&measureTime);
+  SerialMonitor.printf("Measured at: %04d-%02d-%02d %02d:%02d:%02d UTC (%lu)\n",
+                measureTm->tm_year + 1900, measureTm->tm_mon + 1, measureTm->tm_mday,
+                measureTm->tm_hour, measureTm->tm_min, measureTm->tm_sec, payload.measured_time);
+  
+  if (payload.transmitted_time > 0) {
+    time_t transTime = payload.transmitted_time;
+    struct tm* transTm = localtime(&transTime);
+    SerialMonitor.printf("Transmitted at: %04d-%02d-%02d %02d:%02d:%02d UTC (%lu)\n",
+                  transTm->tm_year + 1900, transTm->tm_mon + 1, transTm->tm_mday,
+                  transTm->tm_hour, transTm->tm_min, transTm->tm_sec, payload.transmitted_time);
+  } else {
+    SerialMonitor.println("Transmitted at: Not yet transmitted");
+  }
+  
   SerialMonitor.printf("Transmitted: %s\n", payload.transmitted ? "YES" : "NO");
   SerialMonitor.println("========================");
 }
@@ -298,6 +342,15 @@ bool transmitBCDFrame(SensorPayload& payload) {
     SerialMonitor.printf("⚠ Frame ID %d already transmitted, skipping\n", payload.payload_id);
     return true; // Return true since it was already sent successfully
   }
+  
+  // Record transmission time
+  uint32_t transmissionTime;
+  if (timeIsSynced) {
+    transmissionTime = (millis() / 1000) + timeOffset;
+  } else {
+    transmissionTime = time(nullptr);
+  }
+  payload.transmitted_time = transmissionTime;  // NEW: Record when transmitted
   
   SerialMonitor.printf("📤 Preparing to send Frame ID %d...\n", payload.payload_id);
   
@@ -313,11 +366,28 @@ bool transmitBCDFrame(SensorPayload& payload) {
     frameHex += hex;
   }
   
-  String bcdPayload = frameHex + "," + String(payload.payload_id) + "," + String(payload.timestamp);
+  // NEW: Extended payload format with timing data
+  String bcdPayload = frameHex + "," + String(payload.payload_id) + "," + 
+                      String(payload.measured_time) + "," + String(payload.transmitted_time) + "," +
+                      String(payload.battery_voltage, 2) + "," + String(payload.battery_percentage);
   String topic = String(bcd_topic_base) + "/" + String(payload.payload_id);
   
   SerialMonitor.printf("📡 Publishing to topic: %s\n", topic.c_str());
   SerialMonitor.printf("📋 Payload length: %d bytes\n", bcdPayload.length());
+  
+  // Show timing information
+  time_t measureTime = payload.measured_time;
+  time_t transTime = payload.transmitted_time;
+  struct tm* measureTm = localtime(&measureTime);
+  struct tm* transTm = localtime(&transTime);
+  
+  SerialMonitor.printf("⏱ Measured: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+                measureTm->tm_year + 1900, measureTm->tm_mon + 1, measureTm->tm_mday,
+                measureTm->tm_hour, measureTm->tm_min, measureTm->tm_sec);
+  SerialMonitor.printf("⏱ Transmitting: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+                transTm->tm_year + 1900, transTm->tm_mon + 1, transTm->tm_mday,
+                transTm->tm_hour, transTm->tm_min, transTm->tm_sec);
+  SerialMonitor.printf("⏱ Delay: %lu seconds\n", payload.transmitted_time - payload.measured_time);
   
   // Add extra safety check before publishing
   if (!mqtt.connected()) {
@@ -387,11 +457,16 @@ void takeMeasurement() {
   // Create new payload
   SensorPayload& payload = rtc_payload_buffer[bufferIndex];
   
+  uint32_t currentTime;
   if (timeIsSynced) {
-    payload.timestamp = (millis() / 1000) + timeOffset;
+    currentTime = (millis() / 1000) + timeOffset;
   } else {
-    payload.timestamp = time(nullptr);
+    currentTime = time(nullptr);
   }
+  
+  payload.timestamp = currentTime;        // Legacy field for compatibility
+  payload.measured_time = currentTime;    // NEW: Record measurement time
+  payload.transmitted_time = 0;           // NEW: Will be set when transmitted
   payload.payload_id = current_payload_id++;
   payload.transmitted = false; // ✅ Initialize transmission status
   
@@ -405,23 +480,39 @@ void takeMeasurement() {
     humid = dht.readHumidity();
   }
   
+  // Read battery voltage and percentage
+  int analogVal = analogRead(BATTERY_ADC_PIN);
+  float inputVoltage = ((float(analogVal)/4096) * 3.3) * 2.068;
+  int batteryPercent = getBatteryPercentage(inputVoltage);
+  
   payload.temperature = temp;
   payload.humidity = humid;
+  payload.battery_voltage = inputVoltage;
+  payload.battery_percentage = batteryPercent;
   payload.valid = !isnan(payload.temperature) && !isnan(payload.humidity) &&
                   payload.temperature > -40 && payload.temperature < 80 &&
-                  payload.humidity >= 0 && payload.humidity <= 100;
+                  payload.humidity >= 0 && payload.humidity <= 100 &&
+                  payload.battery_voltage > 0 && payload.battery_voltage < 5.0;
   
   if (payload.valid) {
     bufferIndex++; // ✅ Increment AFTER storing data
     
-    SerialMonitor.printf("✓ Measurement %d stored: T=%.1f°C, H=%.1f%%, Buffer: %d/%d\n",
+    SerialMonitor.printf("✓ Measurement %d stored: T=%.1f°C, H=%.1f%%, V=%.2fV, B=%d%%, Buffer: %d/%d\n",
                   payload.payload_id, payload.temperature, payload.humidity, 
+                  payload.battery_voltage, payload.battery_percentage,
                   bufferIndex, PAYLOAD_BUFFER_SIZE);
+    
+    // Show measurement timestamp
+    time_t measureTime = payload.measured_time;
+    struct tm* timeinfo = localtime(&measureTime);
+    SerialMonitor.printf("✓ Measured at: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+                  timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                  timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
     
     displayBCDData(payload);
   } else {
     SerialMonitor.println("✗ Invalid sensor readings! Skipping measurement.");
-    SerialMonitor.printf("Raw values - Temp: %.2f, Humidity: %.2f\n", temp, humid);
+    SerialMonitor.printf("Raw values - Temp: %.2f, Humidity: %.2f, Voltage: %.2f\n", temp, humid, inputVoltage);
   }
 }
 
@@ -538,16 +629,43 @@ void displaySystemStatus() {
   SerialMonitor.printf("MQTT: %s\n", mqtt.connected() ? "Connected" : "Disconnected");
   SerialMonitor.printf("Time synced: %s\n", timeIsSynced ? "YES" : "NO");
   
+  // Show current battery status
+  int analogVal = analogRead(BATTERY_ADC_PIN);
+  float inputVoltage = ((float(analogVal)/4096) * 3.3) * 2.068;
+  int batteryPercent = getBatteryPercentage(inputVoltage);
+  SerialMonitor.printf("Battery: %.2fV (%d%%)\n", inputVoltage, batteryPercent);
+  
   // Show stored payloads with transmission status
   if (bufferIndex > 0) {
     SerialMonitor.println("--- Stored Payloads ---");
     for (int i = 0; i < bufferIndex; i++) {
-      SerialMonitor.printf("Payload %d: ID=%d, T=%.1f°C, H=%.1f%%, Valid=%s, Sent=%s\n",
+      time_t measureTime = rtc_payload_buffer[i].measured_time;
+      struct tm* measureTm = localtime(&measureTime);
+      
+      SerialMonitor.printf("Payload %d: ID=%d, T=%.1f°C, H=%.1f%%, V=%.2fV, B=%d%%, Valid=%s, Sent=%s\n",
                     i, rtc_payload_buffer[i].payload_id,
                     rtc_payload_buffer[i].temperature,
                     rtc_payload_buffer[i].humidity,
+                    rtc_payload_buffer[i].battery_voltage,
+                    rtc_payload_buffer[i].battery_percentage,
                     rtc_payload_buffer[i].valid ? "YES" : "NO",
                     rtc_payload_buffer[i].transmitted ? "YES" : "NO");
+      
+      SerialMonitor.printf("  Measured: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                    measureTm->tm_year + 1900, measureTm->tm_mon + 1, measureTm->tm_mday,
+                    measureTm->tm_hour, measureTm->tm_min, measureTm->tm_sec);
+      
+      if (rtc_payload_buffer[i].transmitted_time > 0) {
+        time_t transTime = rtc_payload_buffer[i].transmitted_time;
+        struct tm* transTm = localtime(&transTime);
+        SerialMonitor.printf(", Transmitted: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                      transTm->tm_year + 1900, transTm->tm_mon + 1, transTm->tm_mday,
+                      transTm->tm_hour, transTm->tm_min, transTm->tm_sec);
+        SerialMonitor.printf(", Delay: %lus", rtc_payload_buffer[i].transmitted_time - rtc_payload_buffer[i].measured_time);
+      } else {
+        SerialMonitor.printf(", Transmitted: Not yet");
+      }
+      SerialMonitor.println();
     }
   }
   SerialMonitor.println("====================");
@@ -759,7 +877,7 @@ void setup() {
     SerialMonitor.println("=== SYSTEM READY ===");
     SerialMonitor.printf("Device: %s (ID: %lu)\n", deviceName, ENCODED_DEVICE_ID);
     SerialMonitor.printf("RTC Buffer: %d/%d payloads\n", bufferIndex, PAYLOAD_BUFFER_SIZE);
-    SerialMonitor.println("Ready to send BCD data via RTC buffer");
+    SerialMonitor.println("Ready to send BCD data with battery monitoring via RTC buffer");
     SerialMonitor.println("================================");
 }
 
