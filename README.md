@@ -1,3 +1,5 @@
+# Nyuki-Tech
+
 ### DHT Sensor Pinout
 
 | DHT Pin | ESP32 Pin | Function |
@@ -5,8 +7,6 @@
 | VCC     | 3V3       | Power    |
 | GND     | GND       | Ground   |
 | DATA    | GPIO15    | Data     |
-
-# Nyuki-Tech
 
 ## Power Management
 
