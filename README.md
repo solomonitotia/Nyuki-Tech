@@ -24,3 +24,19 @@ This project uses a **TP4056 Charge Module** for battery charging and power mana
 | OUT-       | Battery Connector -   | Power output ground        |
 
 This setup allows the solar panel to charge the battery, while the system draws power from the battery via the TP4056 output.
+
+### Voltage Divider Wiring for Battery Sensing
+
+```
+TP4056 OUT+ (4.2V max) ──┬── To TTGO Battery Connector (+)
+						 │
+						 ├── 10kΩ Resistor #1
+						 │
+						 ├── GPIO 35 (ADC Pin)
+						 │
+						 ├── 10kΩ Resistor #2  
+						 │
+TP4056 OUT- (GND) ───────┴── To TTGO Battery Connector (-)
+```
+
+This voltage divider allows safe battery voltage monitoring using the ESP32's ADC pin (GPIO 35).
