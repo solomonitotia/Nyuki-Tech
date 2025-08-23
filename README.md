@@ -37,6 +37,8 @@ TP4056 OUT+ (4.2V max) ──┬── To TTGO Battery Connector (+)
 						 ├── 10kΩ Resistor #2  
 						 │
 TP4056 OUT- (GND) ───────┴── To TTGO Battery Connector (-)
+
+NB - ESP32 Ground must also be connected to the TP4056 OUT -
 ```
 
 This voltage divider allows safe battery voltage monitoring using the ESP32's ADC pin (GPIO 35).
