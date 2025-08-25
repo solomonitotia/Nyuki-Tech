@@ -1,10 +1,21 @@
-// SIM800L BCD Protocol - Enhanced Version with FIXED Buffer Management
-// Updated: August 2025
-// Fix: Duplicate transmission and sleep condition issues resolved
+// Nyuki - Tech
 
+// Select the Corresponding Model
+// #define SIM800L_IP5306_VERSION_20190610
+// #define SIM800L_AXP192_VERSION_20200327
+// #define SIM800C_AXP192_VERSION_20200609
 #define SIM800L_IP5306_VERSION_20200811
 
+// Dependencies for the Board
+// Have to be in the same folder
 #include "utilities.h"
+
+// Libraries
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <time.h>
+#include "esp_sleep.h" // Power Management
 
 // Select your modem
 #define TINY_GSM_MODEM_SIM800
@@ -13,6 +24,9 @@
 #define SerialMonitor Serial
 #define SerialAT Serial1
 
+// See all AT commands, if wanted
+// #define DUMP_AT_COMMANDS
+
 // Define the serial console for debug prints
 #define TINY_GSM_DEBUG SerialMonitor
 
@@ -20,7 +34,23 @@
 #define TINY_GSM_USE_GPRS true
 #define TINY_GSM_USE_WIFI false
 
-#include "esp_sleep.h"
+// GSM/GPRS and MQTT Configuration
+#define GSM_PIN ""
+const char apn[] = "safaricom";
+const char gprsUser[] = "saf";
+const char gprsPass[] = "data";
+
+const char* broker = "mqtt.wirelessplanet.co.ke";
+const char* mqtt_user = "admin";
+const char* mqtt_pass = "root";
+
+const char *json_topic = "BeeHive Monitoring";
+const char *bcd_topic_base = "beehive/frame";
+const char* deviceName = "Bee-01"; 
+
+TinyGsm modem(SerialAT);
+TinyGsmClient client(modem);
+PubSubClient mqtt(client);
 
 // Battery monitoring configuration
 #define BATTERY_ADC_PIN 35
@@ -35,64 +65,30 @@ struct BCDDateTime {
   uint8_t year;
 };
 
-// ✅ FORWARD DECLARATION - Declare struct before RTC variables
+// Payload to be Transmitted
 struct SensorPayload {
   uint32_t timestamp;
-  uint32_t measured_time;     // NEW: When measurement was taken
-  uint32_t transmitted_time;  // NEW: When payload was transmitted
+  uint32_t measured_time;     
+  uint32_t transmitted_time;  
   uint16_t payload_id;
   float temperature;
   float humidity;
   float battery_voltage;
   int battery_percentage;
   bool valid;
-  bool transmitted;  // ✅ NEW: Track transmission status to prevent duplicates
+  bool transmitted; 
 };
 
-int getBatteryPercentage(float voltage) {
-  if (voltage >= 4.1) return 100;
-  if (voltage >= 3.9) return 80;
-  if (voltage >= 3.8) return 60;
-  if (voltage >= 3.7) return 40;
-  if (voltage >= 3.6) return 20;
-  if (voltage >= 3.4) return 10;
-  return 0;
-}
-
-// ✅ RTC MEMORY VARIABLES - These survive deep sleep
+// RTC MEMORY VARIABLES 
 RTC_DATA_ATTR int rtc_buffer_index = 0;
 RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR uint16_t rtc_payload_id = 0;
 RTC_DATA_ATTR bool rtc_first_boot = true;
-// ✅ CRITICAL FIX: Store actual payload data in RTC memory
-RTC_DATA_ATTR SensorPayload rtc_payload_buffer[8];  // Store up to 8 payloads in RTC
+RTC_DATA_ATTR SensorPayload rtc_payload_buffer[8];
 
-// GSM and MQTT Configuration
-#define GSM_PIN ""
-const char apn[] = "safaricom";
-const char gprsUser[] = "saf";
-const char gprsPass[] = "data";
-
-const char* broker = "mqtt.wirelessplanet.co.ke";
-const char* mqtt_user = "admin";
-const char* mqtt_pass = "root";
-
-const char *json_topic = "BeeHive Monitoring";
-const char *bcd_topic_base = "beehive/frame";
-const char* deviceName = "Bee-01"; 
-
-// Timing Configuration
-// #define DEVELOPMENT_MODE true  
-
-#ifdef DEVELOPMENT_MODE
-  const int MEASUREMENT_INTERVAL = 10;  // 10 seconds for development
-  const int TRANSMISSION_INTERVAL = 60; // 1 minute for development
-  const char* mode_name = "DEVELOPMENT";
-#else
-  const int MEASUREMENT_INTERVAL = 150;  // 15 minutes for production
-  const int TRANSMISSION_INTERVAL = 1200; // 2 hours for production
-  const char* mode_name = "PRODUCTION";
-#endif
+int& bufferIndex = rtc_buffer_index;         
+uint16_t& current_payload_id = rtc_payload_id; 
+SensorPayload* payloadBuffer = rtc_payload_buffer;
 
 // BCD Protocol Configuration
 #define FRAME_START 0x68
@@ -105,29 +101,27 @@ const uint32_t DEVICE_BASE_ID = 2300800;
 const uint8_t DEVICE_NUMBER = 1;
 const uint32_t ENCODED_DEVICE_ID = DEVICE_BASE_ID + DEVICE_NUMBER;
 
-// ✅ FIXED: Use smaller buffer size that fits in RTC memory
 #define PAYLOAD_BUFFER_SIZE 8
 
-// Libraries
-#include <TinyGsmClient.h>
-#include <PubSubClient.h>
-#include <DHT.h>
-#include <time.h>
+// Timing Configuration
+// Comment Out to set it in Development Mode
+// #define DEVELOPMENT_MODE true  
+#ifdef DEVELOPMENT_MODE
+  const int MEASUREMENT_INTERVAL = 10; 
+  const int TRANSMISSION_INTERVAL = 80;
+  const char* mode_name = "DEVELOPMENT";
+#else
+  const int MEASUREMENT_INTERVAL = 150; 
+  const int TRANSMISSION_INTERVAL = 1200; 
+  const char* mode_name = "PRODUCTION";
+#endif
 
 // DHT Setup
 #define DHTPIN 15
 #define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
 
-TinyGsm modem(SerialAT);
-TinyGsmClient client(modem);
-PubSubClient mqtt(client);
-
-// ✅ FIXED: Global variables now use RTC data directly
-int& bufferIndex = rtc_buffer_index;          // Reference to RTC memory
-uint16_t& current_payload_id = rtc_payload_id; // Reference to RTC memory
-SensorPayload* payloadBuffer = rtc_payload_buffer; // Point to RTC buffer
-
+// Variables
 bool networkConnected = false;
 bool timeIsSynced = false;
 unsigned long timeOffset = 0;
@@ -136,18 +130,190 @@ unsigned long lastMeasurement = 0;
 unsigned long lastTransmission = 0;
 const unsigned long TIME_SYNC_INTERVAL = 3600000;
 
-// Function Prototypes
-void setupModemAndNetwork();
-void connectMQTT();
-void takeMeasurement();
-void transmitPayloads();
-void enterDeepSleep();
-bool syncPreciseNetworkTime();
-void handleSerialCommands();
-void displaySystemStatus();
-void handleWakeUp();
-bool shouldEnterDeepSleep();
+void setup() {
+    SerialMonitor.begin(115200);
+    delay(10);
 
+    handleWakeUp();
+    
+    SerialMonitor.println("=== BEEHIVE MONITORING SYSTEM ===");
+    SerialMonitor.printf("Mode: %s\n", mode_name);
+    SerialMonitor.printf("Encoded Device ID: %lu\n", ENCODED_DEVICE_ID);
+    SerialMonitor.printf("Using RTC memory buffer (survives deep sleep)\n");
+
+    dht.begin();
+    SerialMonitor.println("DHT sensor initialized");
+
+    // Initialize basic time
+    struct tm tm;
+    tm.tm_year = 2025 - 1900;
+    tm.tm_mon = 7;
+    tm.tm_mday = 16;
+    tm.tm_hour = 12;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    tm.tm_isdst = 0;
+    time_t t = mktime(&tm);
+    
+    setupModemAndNetwork();
+    if (networkConnected) {
+        connectMQTT();
+    }
+    
+    SerialMonitor.println("✓ System initialized successfully");
+    
+    unsigned long currentTime = millis();
+    lastMeasurement = currentTime - (MEASUREMENT_INTERVAL * 1000UL) - 1000;
+    lastTransmission = currentTime;
+    
+    SerialMonitor.println("=== SYSTEM READY ===");
+    SerialMonitor.printf("Device: %s (ID: %lu)\n", deviceName, ENCODED_DEVICE_ID);
+    SerialMonitor.printf("RTC Buffer: %d/%d payloads\n", bufferIndex, PAYLOAD_BUFFER_SIZE);
+    SerialMonitor.println("Ready to send BCD data with battery monitoring via RTC buffer");
+    SerialMonitor.println("================================");
+}
+
+void loop() {
+    unsigned long currentTime = millis();
+
+    // ✅ FIXED: Handle post-wake-up state properly
+    static bool hasHandledWakeupInLoop = false;
+    
+    // Only run wake-up handling once per boot cycle in loop
+    if (!hasHandledWakeupInLoop) {
+        // Check if we need to re-establish connections after wake-up
+        if (bootCount > 1 && !networkConnected) {
+            SerialMonitor.println("=== POST-WAKE-UP RECONNECTION ===");
+            setupModemAndNetwork();
+            
+            if (networkConnected && !mqtt.connected()) {
+                connectMQTT();
+            }
+        }
+        hasHandledWakeupInLoop = true;
+    }
+
+    // Check modem status (regular monitoring)
+    if (!modem.isNetworkConnected() && networkConnected) {
+        SerialMonitor.println("Network disconnected - attempting reconnection");
+        networkConnected = false;
+        setupModemAndNetwork();
+        
+        if (networkConnected && !mqtt.connected()) {
+            connectMQTT();
+        }
+        return;
+    }
+
+    handleSerialCommands();
+    
+    // Debug output
+    static unsigned long lastDebug = 0;
+    #ifdef DEVELOPMENT_MODE
+    unsigned long debugInterval = 5000;
+    #else
+    unsigned long debugInterval = 10000;
+    #endif
+    
+    if (currentTime - lastDebug >= debugInterval) {
+        SerialMonitor.printf("Running - Buffer: %d/%d, Next measurement: %lus\n", 
+                      bufferIndex, PAYLOAD_BUFFER_SIZE,
+                      ((MEASUREMENT_INTERVAL * 1000UL) - (currentTime - lastMeasurement)) / 1000);
+        lastDebug = currentTime;
+    }
+    
+    if (!mqtt.connected() && networkConnected) {
+        connectMQTT();
+        delay(100);
+    }
+    
+    // ✅ FIXED: Measurement check with buffer overflow protection
+    if (currentTime - lastMeasurement >= (MEASUREMENT_INTERVAL * 1000UL)) {
+        SerialMonitor.println("=== MEASUREMENT TIME ===");
+        takeMeasurement();
+        lastMeasurement = currentTime;
+    }
+    
+    // ✅ FIXED: Transmission check with duplicate prevention
+    bool timeForTransmission = (currentTime - lastTransmission >= (TRANSMISSION_INTERVAL * 1000UL));
+    bool bufferNeedsTransmission = (bufferIndex >= PAYLOAD_BUFFER_SIZE);
+    
+    // ✅ CRITICAL: Prevent rapid successive transmission calls
+    static unsigned long lastTransmissionAttempt = 0;
+    const unsigned long MIN_TRANSMISSION_GAP = 5000; // 5 seconds minimum between attempts
+    
+    if ((timeForTransmission || bufferNeedsTransmission) && 
+        (currentTime - lastTransmissionAttempt >= MIN_TRANSMISSION_GAP)) {
+        
+        SerialMonitor.println("=== TRANSMISSION TIME ===");
+        if (bufferNeedsTransmission) {
+            SerialMonitor.println("Trigger: Buffer full");
+        }
+        if (timeForTransmission) {
+            SerialMonitor.println("Trigger: Scheduled time");
+        }
+        
+        lastTransmissionAttempt = currentTime; // Record attempt time
+        
+        if (!networkConnected) {
+            SerialMonitor.println("Network not connected, attempting reconnection...");
+            setupModemAndNetwork();
+        }
+        
+        if (networkConnected && bufferIndex > 0) {
+            // Double-check we have untransmitted payloads
+            bool hasUntransmitted = false;
+            for (int i = 0; i < bufferIndex; i++) {
+                if (rtc_payload_buffer[i].valid && !rtc_payload_buffer[i].transmitted) {
+                    hasUntransmitted = true;
+                    break;
+                }
+            }
+            
+            if (hasUntransmitted) {
+                SerialMonitor.println("📤 Starting transmission of untransmitted payloads...");
+                transmitPayloads();
+                lastTransmission = currentTime;
+            } else {
+                SerialMonitor.println("ℹ All payloads already transmitted, skipping");
+            }
+        } else if (bufferIndex >= PAYLOAD_BUFFER_SIZE) {
+            SerialMonitor.println("⚠ Critical: Buffer full but no network connection!");
+            // In critical situation, we might need to drop old data
+            SerialMonitor.println("⚠ Dropping oldest payload to prevent system hang");
+            for (int i = 0; i < PAYLOAD_BUFFER_SIZE - 1; i++) {
+                rtc_payload_buffer[i] = rtc_payload_buffer[i + 1];
+            }
+            bufferIndex = PAYLOAD_BUFFER_SIZE - 1;
+        }
+    } else if (timeForTransmission || bufferNeedsTransmission) {
+        // Log why transmission was skipped
+        unsigned long timeUntilNext = MIN_TRANSMISSION_GAP - (currentTime - lastTransmissionAttempt);
+        SerialMonitor.printf("⏸ Transmission blocked - %lu ms until next attempt allowed\n", timeUntilNext);
+    }
+    
+    // Periodic time resync
+    if (timeIsSynced && networkConnected && (currentTime - lastTimeSync >= TIME_SYNC_INTERVAL)) {
+        SerialMonitor.println("=== PERIODIC TIME RESYNC ===");
+        if (syncPreciseNetworkTime()) {
+            lastTimeSync = currentTime;
+        }
+    }
+
+    if (networkConnected && mqtt.connected()) {
+        mqtt.loop();
+    }
+    
+    delay(1000);
+    
+    // ✅ FIXED: Deep sleep decision with better logic
+    if (shouldEnterDeepSleep()) {
+        SerialMonitor.println("✓ Conditions met for deep sleep");
+        enterDeepSleep();
+    }
+}
+
+// Functions
 // BCD Protocol Functions
 uint8_t decimalToBCD(uint8_t decimal) {
   return ((decimal / 10) << 4) | (decimal % 10);
@@ -335,7 +501,6 @@ void displayBCDData(SensorPayload& payload) {
   SerialMonitor.println("========================");
 }
 
-// ✅ FIXED: Enhanced transmission status tracking with timestamp
 bool transmitBCDFrame(SensorPayload& payload) {
   // Skip if already transmitted
   if (payload.transmitted) {
@@ -414,6 +579,7 @@ bool transmitBCDFrame(SensorPayload& payload) {
   }
 }
 
+// MQTT Function
 void connectMQTT() {
   int attempts = 0;
   while (!mqtt.connected() && attempts < 5) {
@@ -434,7 +600,6 @@ void connectMQTT() {
   }
 }
 
-// ✅ FIXED: Proper buffer overflow handling
 void takeMeasurement() {
   SerialMonitor.println("=== TAKING MEASUREMENT ===");
   SerialMonitor.printf("Current buffer index: %d\n", bufferIndex);
@@ -838,185 +1003,12 @@ void setupModemAndNetwork() {
   }
 }
 
-void setup() {
-    SerialMonitor.begin(115200);
-    delay(10);
-
-    handleWakeUp();
-    
-    SerialMonitor.println("=== BEEHIVE MONITORING SYSTEM ===");
-    SerialMonitor.printf("Mode: %s\n", mode_name);
-    SerialMonitor.printf("Encoded Device ID: %lu\n", ENCODED_DEVICE_ID);
-    SerialMonitor.printf("Using RTC memory buffer (survives deep sleep)\n");
-
-    dht.begin();
-    SerialMonitor.println("DHT sensor initialized");
-
-    // Initialize basic time
-    struct tm tm;
-    tm.tm_year = 2025 - 1900;
-    tm.tm_mon = 7;
-    tm.tm_mday = 16;
-    tm.tm_hour = 12;
-    tm.tm_min = 0;
-    tm.tm_sec = 0;
-    tm.tm_isdst = 0;
-    time_t t = mktime(&tm);
-    
-    setupModemAndNetwork();
-    if (networkConnected) {
-        connectMQTT();
-    }
-    
-    SerialMonitor.println("✓ System initialized successfully");
-    
-    unsigned long currentTime = millis();
-    lastMeasurement = currentTime - (MEASUREMENT_INTERVAL * 1000UL) - 1000;
-    lastTransmission = currentTime;
-    
-    SerialMonitor.println("=== SYSTEM READY ===");
-    SerialMonitor.printf("Device: %s (ID: %lu)\n", deviceName, ENCODED_DEVICE_ID);
-    SerialMonitor.printf("RTC Buffer: %d/%d payloads\n", bufferIndex, PAYLOAD_BUFFER_SIZE);
-    SerialMonitor.println("Ready to send BCD data with battery monitoring via RTC buffer");
-    SerialMonitor.println("================================");
-}
-
-void loop() {
-    unsigned long currentTime = millis();
-
-    // ✅ FIXED: Handle post-wake-up state properly
-    static bool hasHandledWakeupInLoop = false;
-    
-    // Only run wake-up handling once per boot cycle in loop
-    if (!hasHandledWakeupInLoop) {
-        // Check if we need to re-establish connections after wake-up
-        if (bootCount > 1 && !networkConnected) {
-            SerialMonitor.println("=== POST-WAKE-UP RECONNECTION ===");
-            setupModemAndNetwork();
-            
-            if (networkConnected && !mqtt.connected()) {
-                connectMQTT();
-            }
-        }
-        hasHandledWakeupInLoop = true;
-    }
-
-    // Check modem status (regular monitoring)
-    if (!modem.isNetworkConnected() && networkConnected) {
-        SerialMonitor.println("Network disconnected - attempting reconnection");
-        networkConnected = false;
-        setupModemAndNetwork();
-        
-        if (networkConnected && !mqtt.connected()) {
-            connectMQTT();
-        }
-        return;
-    }
-
-    handleSerialCommands();
-    
-    // Debug output
-    static unsigned long lastDebug = 0;
-    #ifdef DEVELOPMENT_MODE
-    unsigned long debugInterval = 5000;
-    #else
-    unsigned long debugInterval = 10000;
-    #endif
-    
-    if (currentTime - lastDebug >= debugInterval) {
-        SerialMonitor.printf("Running - Buffer: %d/%d, Next measurement: %lus\n", 
-                      bufferIndex, PAYLOAD_BUFFER_SIZE,
-                      ((MEASUREMENT_INTERVAL * 1000UL) - (currentTime - lastMeasurement)) / 1000);
-        lastDebug = currentTime;
-    }
-    
-    if (!mqtt.connected() && networkConnected) {
-        connectMQTT();
-        delay(100);
-    }
-    
-    // ✅ FIXED: Measurement check with buffer overflow protection
-    if (currentTime - lastMeasurement >= (MEASUREMENT_INTERVAL * 1000UL)) {
-        SerialMonitor.println("=== MEASUREMENT TIME ===");
-        takeMeasurement();
-        lastMeasurement = currentTime;
-    }
-    
-    // ✅ FIXED: Transmission check with duplicate prevention
-    bool timeForTransmission = (currentTime - lastTransmission >= (TRANSMISSION_INTERVAL * 1000UL));
-    bool bufferNeedsTransmission = (bufferIndex >= PAYLOAD_BUFFER_SIZE);
-    
-    // ✅ CRITICAL: Prevent rapid successive transmission calls
-    static unsigned long lastTransmissionAttempt = 0;
-    const unsigned long MIN_TRANSMISSION_GAP = 5000; // 5 seconds minimum between attempts
-    
-    if ((timeForTransmission || bufferNeedsTransmission) && 
-        (currentTime - lastTransmissionAttempt >= MIN_TRANSMISSION_GAP)) {
-        
-        SerialMonitor.println("=== TRANSMISSION TIME ===");
-        if (bufferNeedsTransmission) {
-            SerialMonitor.println("Trigger: Buffer full");
-        }
-        if (timeForTransmission) {
-            SerialMonitor.println("Trigger: Scheduled time");
-        }
-        
-        lastTransmissionAttempt = currentTime; // Record attempt time
-        
-        if (!networkConnected) {
-            SerialMonitor.println("Network not connected, attempting reconnection...");
-            setupModemAndNetwork();
-        }
-        
-        if (networkConnected && bufferIndex > 0) {
-            // Double-check we have untransmitted payloads
-            bool hasUntransmitted = false;
-            for (int i = 0; i < bufferIndex; i++) {
-                if (rtc_payload_buffer[i].valid && !rtc_payload_buffer[i].transmitted) {
-                    hasUntransmitted = true;
-                    break;
-                }
-            }
-            
-            if (hasUntransmitted) {
-                SerialMonitor.println("📤 Starting transmission of untransmitted payloads...");
-                transmitPayloads();
-                lastTransmission = currentTime;
-            } else {
-                SerialMonitor.println("ℹ All payloads already transmitted, skipping");
-            }
-        } else if (bufferIndex >= PAYLOAD_BUFFER_SIZE) {
-            SerialMonitor.println("⚠ Critical: Buffer full but no network connection!");
-            // In critical situation, we might need to drop old data
-            SerialMonitor.println("⚠ Dropping oldest payload to prevent system hang");
-            for (int i = 0; i < PAYLOAD_BUFFER_SIZE - 1; i++) {
-                rtc_payload_buffer[i] = rtc_payload_buffer[i + 1];
-            }
-            bufferIndex = PAYLOAD_BUFFER_SIZE - 1;
-        }
-    } else if (timeForTransmission || bufferNeedsTransmission) {
-        // Log why transmission was skipped
-        unsigned long timeUntilNext = MIN_TRANSMISSION_GAP - (currentTime - lastTransmissionAttempt);
-        SerialMonitor.printf("⏸ Transmission blocked - %lu ms until next attempt allowed\n", timeUntilNext);
-    }
-    
-    // Periodic time resync
-    if (timeIsSynced && networkConnected && (currentTime - lastTimeSync >= TIME_SYNC_INTERVAL)) {
-        SerialMonitor.println("=== PERIODIC TIME RESYNC ===");
-        if (syncPreciseNetworkTime()) {
-            lastTimeSync = currentTime;
-        }
-    }
-
-    if (networkConnected && mqtt.connected()) {
-        mqtt.loop();
-    }
-    
-    delay(1000);
-    
-    // ✅ FIXED: Deep sleep decision with better logic
-    if (shouldEnterDeepSleep()) {
-        SerialMonitor.println("✓ Conditions met for deep sleep");
-        enterDeepSleep();
-    }
+int getBatteryPercentage(float voltage) {
+  if (voltage >= 4.1) return 100;
+  if (voltage >= 3.9) return 80;
+  if (voltage >= 3.8) return 60;
+  if (voltage >= 3.7) return 40;
+  if (voltage >= 3.6) return 20;
+  if (voltage >= 3.4) return 10;
+  return 0;
 }
